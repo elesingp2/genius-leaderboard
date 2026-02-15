@@ -1,53 +1,63 @@
 # genius-leaderboard
 
-Мини-бенч для сравнения LLM по разбору строк песен.
+Мини-бенч для оценки качества разбора строк песен (`promptfoo` + OpenRouter + web evidence).
 
 ## Что делает
 
-Для каждой целевой строки песни агент возвращает JSON:
+Для каждой целевой строки агент (`providers/agent.py`) возвращает JSON:
 
-- `meaning`: краткое объяснение смысла;
-- `references`: ссылки с `url` и `snippet`;
-- `uncertainties`: список сомнений/ошибок.
+- `meaning`: интерпретация строки (коротко и по делу);
+- `references`: источники с `claim/url/snippet/why_it_supports/confidence`;
+- `uncertainties`: причины понижения уверенности.
 
-Оценка: `GeniusScore` (`0..1`) через `promptfoo` rubric.
+Оценка идёт через `llm-rubric` метрику `GeniusScore` (`0..1`) в `promptfooconfig.yaml`.
 
-## Быстрый старт
+## Требования
 
-1) Заполни `.env` (только ключи):
+- Python 3.10+;
+- Node.js 18+;
+- `promptfoo` (через `npm i -g promptfoo` или `npx promptfoo ...`).
+
+## Конфиг
+
+1) Заполни `.env`:
 
 ```bash
-OPENROUTER_API_KEY=...
-SEARCH_API_KEY=...
+OPENROUTER_API_KEY=sk-or-v1-...
+SEARCH_API_KEY=tvly-...
+OPENROUTER_JUDGE_MODEL=liquid/lfm-2.5-1.2b-instruct:free
 ```
 
-2) Настрой `llm_config.json`:
+1) Настрой `llm_config.json` (актуальные ключи):
 
 ```json
 {
-  "openrouter_model": "liquid/lfm-2.5-1.2b-instruct:free",
-  "openrouter_judge_model": "liquid/lfm-2.5-1.2b-instruct:free",
+  "openrouter_model": "arcee-ai/trinity-large-preview:free",
   "enable_web_search": true,
-  "system_prompt": "You explain one target lyric line using song context. Write 1-2 concise sentences.",
-  "user_prompt": "Song: {song_title} — {artist}\\n\\nTarget line:\\n\\\"{target_line}\\\"\\n\\nContext window from song:\\n{context_window}\\n\\nEvidence:\\n{evidence}"
+  "system_prompt": "...",
+  "user_prompt": "..."
 }
 ```
 
-`enable_web_search: false` выключает Tavily и агент отвечает только по входному тексту песни/весам модели.
+`enable_web_search: false` отключает Tavily, и агент строит интерпретацию только по тексту песни/контексту.
 
-3) Подготовь `tests.jsonl` (по одному кейсу на песню/строку):
+## Данные тестов
+
+`tests.jsonl` содержит строки в формате:
 
 ```json
-{"vars":{"song_title":"sirens","artist":"Kai Angel","target_line":"She said, \"I am not afraid to die\"","song_text":"...full song text..."}}
+{"vars":{"song_title":"amy","artist":"Kai Angel","target_line":"I stole a Chrome beanie"}}
 ```
 
-4) Запусти:
+Тексты песен и дефолтные переменные заданы в `promptfooconfig.yaml` (`defaultTest.vars`).
+
+## Запуск
 
 ```bash
 promptfoo eval --no-cache
 ```
 
-Опционально:
+Опционально открыть UI:
 
 ```bash
 promptfoo view
@@ -55,11 +65,11 @@ promptfoo view
 
 ## Контракт ответа агента
 
-`providers/agent.py` обязан печатать в `stdout` только валидный JSON:
+Агент должен печатать в `stdout` только валидный JSON:
 
 ```json
 {
-  "meaning": "string",
+  "meaning": "string | null",
   "references": [
     {
       "claim": "string",
@@ -69,13 +79,18 @@ promptfoo view
       "confidence": 0.0
     }
   ],
-  "uncertainties": []
+  "uncertainties": ["string"]
 }
 ```
 
-Если доказательств нет: `references: []`.
+Примечания:
+
+- если надёжных источников нет, возвращается `references: []`;
+- слабые источники (`confidence < 0.60`) не отдаются в финальный JSON;
+- `uncertainties` объясняет, почему нет веб-доказательств (disabled/error/low-confidence/no usable sources).
 
 ## Частые проблемы
 
-- `provider exec failed`: скрипт напечатал не JSON или упал;
-- `MetadataLookupWarning`: шум Node-зависимостей, можно игнорировать.
+- `provider exec failed`: скрипт вернул невалидный JSON или упал;
+- `SEARCH_API_KEY` пустой при включённом web search: будут `uncertainties` про поиск;
+- `MetadataLookupWarning`: шум зависимостей, обычно не влияет на результаты.
