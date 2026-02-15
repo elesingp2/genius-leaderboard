@@ -1,0 +1,28 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+description: 'Getting started'
+env:
+  OPENROUTER_API_KEY: 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
+  SEARCH_API_KEY: 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 # tavily
+prompts:
+  - 'Convert this English to {{language}}: {{input}}'
+  - 'Translate to {{language}}: {{input}}'
+
+providers:
+  - id: openrouter:stepfun/step-3.5-flash:free
+    config:
+      temperature: 0.7
+      max_tokens: 1000
+
+tests:
+  - vars:
+      language: French
+      input: Hello world
+    assert:
+      - type: contains
+        value: 'Bonjour le monde'
+  - vars:
+      language: Spanish
+      input: Where is the library?
+    assert:
+      - type: icontains
+        value: 'Dónde está la biblioteca'
