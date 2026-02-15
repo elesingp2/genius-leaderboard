@@ -1,6 +1,6 @@
 # genius-leaderboard
 
-Мини-бенч для оценки качества разбора строк песен (`promptfoo` + OpenRouter + web evidence).
+Мини-бенч для оценки как llm шарят за репчик  (`promptfoo` + OpenRouter + web evidence).
 
 ## Что делает
 
