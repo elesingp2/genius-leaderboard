@@ -1,8 +1,8 @@
 # yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
-description: Genius-bench MVP
+description: Genius-bench
 
 prompts:
-  - '{"line":"{{line}}","model":"{{model}}"}'
+  - '{"song_title":"{{song_title}}","artist":"{{artist}}","song_text":"{{song_text}}","target_line":"{{target_line}}"}'
 
 providers:
   - id: exec:python3 providers/agent.py
@@ -12,11 +12,49 @@ tests: tests.jsonl
 defaultTest:
   assert:
     - type: is-json
+    - type: not-contains
+      value: Meaning unavailable from model response.
+    - type: javascript
+      value: |
+        const o = JSON.parse(output);
+        if (!o || typeof o !== 'object') return false;
+        if (typeof o.meaning !== 'string' || o.meaning.trim().length < 24) return false;
+        if (!Array.isArray(o.references) || !Array.isArray(o.uncertainties)) return false;
+        const webSearchDisabled = o.uncertainties.some(u =>
+          typeof u === 'string' && u.toLowerCase().includes('web search disabled')
+        );
+        if (webSearchDisabled) return true;
+        if (o.references.length === 0) return false;
+        // Deterministic evidence gate to block obvious false positives.
+        // If references exist, each must look usable and not be low-confidence junk.
+        return o.references.every(r => {
+          if (!r || typeof r !== 'object') return false;
+          if (typeof r.url !== 'string' || !r.url.startsWith('http')) return false;
+          if (typeof r.snippet !== 'string' || r.snippet.trim().length < 40) return false;
+          if (typeof r.claim !== 'string' || r.claim.trim().length < 12) return false;
+          if (typeof r.why_it_supports !== 'string' || r.why_it_supports.trim().length < 12) return false;
+          if (typeof r.confidence !== 'number' || r.confidence < 0.60) return false;
+
+          const u = r.url.toLowerCase();
+          if (u.endsWith('.pdf')) return false;
+          if (u.includes('/smash/get/') || u.includes('arxiv.org') || u.includes('researchgate.net')) return false;
+          if (u.startsWith('ftp://')) return false;
+          return true;
+        });
     - type: llm-rubric
-      provider: openrouter:stepfun/step-3.5-flash:free
+      provider: openrouter:{{env.OPENROUTER_JUDGE_MODEL}}
       metric: GeniusScore
       value: >-
-        Score 0 if output is invalid JSON or any reference misses url/snippet;
-        otherwise score = 0.6*meaning + 0.4*references where meaning rewards
-        accuracy/clarity and references rewards specific claim + supporting
-        snippet + logical why_it_supports. Return a number from 0 to 1.
+        Evaluate only the quality of `meaning` in the JSON output.
+        Ignore whether web search is enabled/disabled.
+        Ignore `references` and `uncertainties` when scoring.
+
+        Scoring:
+        - 0.0-0.2: nonsense, generic filler, or not an interpretation.
+        - 0.3-0.5: partially relevant but vague or shallow.
+        - 0.6-0.8: clear, specific interpretation grounded in the target lyric context.
+        - 0.9-1.0: very precise, nuanced, and concise interpretation.
+
+        Return only one number from 0 to 1.
+        Output format must be exactly like: 0.74
+        No JSON, no explanation, no extra text.

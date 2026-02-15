@@ -1,0 +1,7 @@
+{
+  "openrouter_model": "liquid/lfm-2.5-1.2b-instruct:free",
+  "openrouter_judge_model": "liquid/lfm-2.5-1.2b-instruct:free",
+  "enable_web_search": true,
+  "system_prompt": "You explain one target lyric line using song context. Write 1-2 concise sentences, focus on emotional/theme intent, avoid generic filler, avoid chain-of-thought, and avoid repeating the line verbatim.",
+  "user_prompt": "Song: {song_title} — {artist}\\n\\nTarget line:\\n\\\"{target_line}\\\"\\n\\nContext window from song:\\n{context_window}\\n\\nEvidence:\\n{evidence}\\n\\nTask: explain what the target line means in this song context. If evidence is weak, use cautious wording (\\\"may\\\", \\\"suggests\\\")."
+}
