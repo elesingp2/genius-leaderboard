@@ -44,7 +44,7 @@ SEARCH_API_KEY=...
 4) Запусти:
 
 ```bash
-promptfoo eval
+promptfoo eval --no-cache
 ```
 
 Опционально:

@@ -2,7 +2,7 @@
 description: Genius-bench
 
 prompts:
-  - '{"song_title":"{{song_title}}","artist":"{{artist}}","song_text":"{{song_text}}","target_line":"{{target_line}}"}'
+  - '{"song_title":{{song_title | dump}},"artist":{{artist | dump}},"song_text":{{(song_text_body_double if song_title == "body double" else song_text_amy) | dump}},"target_line":{{target_line | dump}}}'
 
 providers:
   - id: exec:python3 providers/agent.py
@@ -10,6 +10,76 @@ providers:
 tests: tests.jsonl
 
 defaultTest:
+  vars:
+    song_title: amy
+    artist: Kai Angel
+    song_text_amy: |
+      Every needle that was stuck in her hand, I wanna see 'em all
+      So sexy, how she layin' around alone on the floor
+      I see you call, but I never gonna pick up the phone
+      The bottles just formed a star (Star) — what you waitin' for?
+
+      [Предприпев]
+      Yesterday she travel, travel, travel to another world
+      Martini, celebrity status with no clothes on (A-ah)
+      And if you gonna follow, follow, follow me, I'll never go
+      Amy (Fuck), why your name is Amy? (A-ah)
+
+      [Припев]
+      Сука in Lamborghini
+      She say, she hope they see me
+      Майами или Питер?
+      I stole a Chrome beanie
+      Сука in Lamborghini
+      She say, she hope thеy see me
+      Huh, huh, I think I'm faded
+      I'm faded, fadеd…
+      You might also like
+      About to kill me (Snippet 12.11.2025)*
+      Kai Angel
+      chelsea smile
+      Kai Angel
+      body double
+      Kai Angel
+      [Куплет 2]
+      А, е, ты играешь в любовь — это не «Billie Jean», это яд
+      Я лечу в облаках, но внутри меня лёд сейчас
+      Зови меня в ночь, но я снова один — это факт
+      Бутылки вина формируют звезду, формируют star (Ах)
+    song_text_body_double: |
+      [Припев]
+      Блин, бэйби, what the fuck? Пью дешёвый Crémant
+      Едем на кабриолете под 1975 (Е)
+      В салоне ща жара, я Дима, но не Билан
+      Пьяные навсегда, мы пьяные навсегда
+
+      [Постприпев]
+      О-уо (Я-я-я)
+      Она не хотела бы жить на Манхэттене (О-о-о-о, е)
+      Ну, да, мы на приватном
+      На приватном, мы на приватном (Оу)
+
+      [Куплет]
+      Uh, I see dead people, они за мной ща бегут (У-у)
+      Хочу побыть один, но они уже ту-у-ут, они ту-у-ут
+      Я их вижу-у, я их вижу-у
+      Слышишь, teasing me? М-да
+      Ты каждый раз teasing me, о-уо
+      Я в целом не против (Но), блин
+      Темнота в моих руках, темнота в моих руках
+      Это body double, она танцует для меня
+
+      [Припев]
+      Бэйби, what the fuck? Пью дешёвый Crémant
+      Едем на кабриолете под 1975
+      В салоне ща жара, я Дима, но не Билан
+      Пьяные навсегда, мы пьяные навсегда
+
+      [Постприпев]
+      О-уо (Я-я-я)
+      Она не хотела бы жить на Манхэттене (О-о-о-о, е)
+      Ну, да, мы на приватном
+      На приватном, мы на приватном (Оу)
   assert:
     - type: is-json
     - type: not-contains
@@ -20,11 +90,20 @@ defaultTest:
         if (!o || typeof o !== 'object') return false;
         if (typeof o.meaning !== 'string' || o.meaning.trim().length < 24) return false;
         if (!Array.isArray(o.references) || !Array.isArray(o.uncertainties)) return false;
-        const webSearchDisabled = o.uncertainties.some(u =>
-          typeof u === 'string' && u.toLowerCase().includes('web search disabled')
+        const uncertainties = o.uncertainties.filter(u => typeof u === 'string').map(u => u.toLowerCase());
+        const hasNoEvidenceDisclaimer = uncertainties.some(u =>
+          u.includes('web search disabled') ||
+          u.includes('no supporting evidence found') ||
+          u.includes('web search request failed') ||
+          u.includes('web search returned no usable sources') ||
+          u.includes('search returned only low-confidence sources') ||
+          u.includes('search api key is missing') ||
+          (u.includes('based on lyric text alone')) ||
+          (u.includes('low-confidence') && u.includes('speculative'))
         );
-        if (webSearchDisabled) return true;
-        if (o.references.length === 0) return false;
+        if (o.references.length === 0) {
+          return hasNoEvidenceDisclaimer;
+        }
         // Deterministic evidence gate to block obvious false positives.
         // If references exist, each must look usable and not be low-confidence junk.
         return o.references.every(r => {
@@ -35,26 +114,67 @@ defaultTest:
           if (typeof r.why_it_supports !== 'string' || r.why_it_supports.trim().length < 12) return false;
           if (typeof r.confidence !== 'number' || r.confidence < 0.60) return false;
 
+          // Garbage check: base64, data-URI, hex blobs in snippet or claim
+          const garbage = /base64|data:image|iVBOR|\/9j\/4|[A-Za-z0-9+\/=]{80,}|[0-9a-f]{40,}/i;
+          if (garbage.test(r.snippet) || garbage.test(r.claim)) return false;
+
           const u = r.url.toLowerCase();
           if (u.endsWith('.pdf')) return false;
           if (u.includes('/smash/get/') || u.includes('arxiv.org') || u.includes('researchgate.net')) return false;
+          if (u.includes('snap.berkeley.edu') || u.includes('scratch.mit.edu')) return false;
           if (u.startsWith('ftp://')) return false;
           return true;
         });
     - type: llm-rubric
       provider: openrouter:{{env.OPENROUTER_JUDGE_MODEL}}
       metric: GeniusScore
-      value: >-
-        Evaluate only the quality of `meaning` in the JSON output.
-        Ignore whether web search is enabled/disabled.
-        Ignore `references` and `uncertainties` when scoring.
+      threshold: 0.1
+      value: |
+        Judge only the `meaning` field in the JSON output.
+        Ignore `references` and `uncertainties`.
 
-        Scoring:
-        - 0.0-0.2: nonsense, generic filler, or not an interpretation.
-        - 0.3-0.5: partially relevant but vague or shallow.
-        - 0.6-0.8: clear, specific interpretation grounded in the target lyric context.
-        - 0.9-1.0: very precise, nuanced, and concise interpretation.
+        The song is "{{song_title}}" by {{artist}}.
+        The target line is: "{{target_line}}"
 
-        Return only one number from 0 to 1.
-        Output format must be exactly like: 0.74
-        No JSON, no explanation, no extra text.
+        You are a STRICT grader. Default to LOW scores. Most answers deserve 0.2–0.4.
+        A score above 0.6 should be rare and only for genuinely insightful interpretations.
+
+        HARD CAPS (apply FIRST, these override the rubric):
+        - Wrong artist attribution (says it's by X when artist is {{artist}}): → 0.1 max
+        - Describes a different song or line entirely: → 0.0
+        - Factually wrong about what the words literally say: → 0.2 max
+        - Uses filler that could apply to ANY lyric ("captures the essence",
+          "reflects a struggle", "conveys raw emotion", "echoes themes of"): → 0.2 max
+        - Just rephrases/restates the line without adding new insight: → 0.1 max
+        - Mentions correct theme but zero engagement with specific words: → 0.3 max
+
+        SCORING RUBRIC (after caps):
+        0.0 — Null, empty, off-topic, or describes wrong song/line.
+        0.1 — Wrong attribution OR pure restatement with no added meaning.
+        0.2 — Filler only: vague emotional language applicable to any lyric.
+               Or factually incorrect about the words themselves.
+        0.3 — Right theme but generic: says "about death" for a death line
+               without explaining HOW or WHY these specific words convey it.
+        0.4 — Engages with one word/reference from the line but misses the rest,
+               or explanation is shallow/partially wrong.
+        0.5 — Identifies the key references and gives a plausible reading,
+               but lacks depth. Correctly attributes to {{artist}}.
+        0.6 — Solid: explains what the line says AND why, references specific
+               words/slang/allusions. Minor gaps only.
+        0.7 — Good: specific, grounded, no filler, clearly about THIS exact line.
+               Explains the "why" behind word choices.
+        0.8 — Strong: nuanced, connects to song context or artist's style.
+               Would be a useful Genius annotation. Zero filler.
+        0.9 — Excellent: concise, precise, reveals something non-obvious.
+        1.0 — Perfect Genius-level annotation. Essentially never given.
+
+        LITMUS TESTS (if any fail, cap accordingly):
+        1. Swap test: could this meaning apply to a random different lyric? → cap 0.3
+        2. Artist test: does it say the line is BY someone other than {{artist}}? → cap 0.1
+        3. Specificity test: remove the quoted line — does the meaning still make sense
+           without it? If yes, it's too generic → cap 0.3
+        4. Filler test: count filler phrases ("captures", "reflects", "echoes",
+           "conveys", "embodies", "highlights"). More than 1 → cap 0.3
+
+        NOTE: If other artists appear in lyrics as allusions/references by {{artist}},
+        that's CORRECT usage — do not penalize.

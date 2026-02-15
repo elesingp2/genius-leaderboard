@@ -1,247 +1,368 @@
 #!/usr/bin/env python3
 import json, os, re, sys, urllib.request, urllib.error, urllib.parse
 
-# --- .env ---
-if os.path.exists(".env"):
-    for row in open(".env"):
+
+# ── Config ──────────────────────────────────────────────────────────
+
+def _load_env(path=".env"):
+    for row in open(path):
         row = row.strip()
-        if not row or row.startswith("#"): continue
-        sep = "=" if "=" in row else (":" if ":" in row else None)
-        if not sep: continue
-        k, v = row.split(sep, 1)
-        os.environ.setdefault(k.strip(), v.strip().replace("\\n", "\n"))
+        if row and not row.startswith("#") and "=" in row:
+            k, v = row.split("=", 1)
+            v = v.strip()
+            if " #" in v:
+                v = v.split(" #")[0].strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                v = v[1:-1]
+            os.environ.setdefault(k.strip(), v)
 
-def load_llm_config(path="llm_config.json"):
-    def as_bool(v, default=True):
-        if isinstance(v, bool):
-            return v
-        if isinstance(v, str):
-            s = v.strip().lower()
-            if s in {"1", "true", "yes", "on"}:
-                return True
-            if s in {"0", "false", "no", "off"}:
-                return False
-        return default
+def _load_json(path="llm_config.json"):
+    with open(path) as f:
+        return json.load(f)
 
-    with open(path, "r", encoding="utf-8") as fp:
-        cfg = json.load(fp)
+_load_env()
+_cfg = _load_json()
+
+API_KEY    = os.environ["OPENROUTER_API_KEY"]
+SEARCH_KEY = os.getenv("SEARCH_API_KEY", "")
+MODEL      = _cfg.get("openrouter_model", "").strip()
+SYS_PROMPT = _cfg.get("system_prompt", "").strip()
+USR_PROMPT = _cfg.get("user_prompt", "").strip()
+WEB_SEARCH = str(_cfg.get("enable_web_search", True)).lower() in ("1", "true", "yes", "on")
+
+
+# ── Blocked hosts & garbage patterns ────────────────────────────────
+
+# Хосты без полезных интерпретаций (тексты / видео / соцсети / IDE-песочницы)
+BLOCKED_HOSTS = {
+    "genius.com"
+}
+
+# Паттерны мусора в сниппете: base64, data-URI, hex-блобы, длинные хэши
+GARBAGE_PATTERNS = re.compile(
+    r"(?i)"
+    r"(data:image/|base64,|"                         # data-URI / base64
+    r"iVBOR|/9j/4|R0lGOD|"                          # начало PNG/JPEG/GIF base64
+    r"[A-Za-z0-9+/=]{80,}|"                         # длинная base64-строка (≥80 символов подряд)
+    r"[0-9a-f]{40,})"                                # hex-хэш ≥40 символов
+)
+
+# Слова-мусор: часто в сниппетах, но не несут смысла
+NOISE_WORDS = {"search", "video", "click", "download", "free", "play", "watch", "share"}
+
+
+# ── Scoring ─────────────────────────────────────────────────────────
+#
+#  Двухэтапная оценка:
+#    1) lyric_overlap  — сколько слов из СТРОКИ ПЕСНИ нашлось в сниппете
+#    2) meta_overlap   — сколько слов из названия/артиста нашлось в сниппете
+#    3) depth          — доля «новых» слов (≈ интерпретация, а не цитата)
+#
+#  Ключевое правило: depth вносит вклад ТОЛЬКО пропорционально lyric_overlap.
+#  Это гейтит мусор: случайная статья с нулевым overlap не наберёт score,
+#  даже если в ней много уникальных слов.
+#
+#  confidence = BASE + lyric_hits * LYRIC_W + meta_hits * META_W + depth * DEPTH_W * gate
+#  gate = min(lyric_hits / 2, 1.0)  — depth полностью включается при ≥2 совпадениях
+
+CONFIDENCE_BASE   = 0.10   # стартовый балл (только за то, что нашёлся)
+LYRIC_WEIGHT      = 0.15   # за каждое совпавшее слово из строки
+META_WEIGHT       = 0.06   # за каждое совпадение с title/artist (менее важно)
+DEPTH_WEIGHT      = 0.30   # вес «глубины» — но только при наличии overlap
+MIN_LYRIC_OVERLAP = 1      # хотя бы 1 слово из строки должно быть в сниппете
+STRONG_CONFIDENCE = 0.60   # порог сильного источника (совпадает с грейдером)
+MAX_STRONG_REFS   = 3
+MAX_WEAK_REFS     = 2
+MAX_RESULTS_PER_Q = 5
+MIN_SNIPPET_WORDS = 8
+
+
+def _keywords(text):
+    """Множество нормализованных слов длиной > 3."""
+    return {w.strip(".,:;!?()[]{}\"'").lower() for w in text.split() if len(w) > 3}
+
+
+def _host_of(url):
+    try:
+        return urllib.parse.urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+
+def _is_blocked(url):
+    """URL заблокирован: PDF, чёрный список хостов."""
+    lower = url.lower()
+    return lower.endswith(".pdf") or any(h in _host_of(url) for h in BLOCKED_HOSTS)
+
+
+def _is_garbage_snippet(snippet):
+    """
+    Сниппет — мусор, если:
+      - содержит base64 / data-URI / hex-блоб
+      - слишком мало слов (не текст)
+      - больше половины «слов» не ASCII-буквы (бинарный шум)
+    """
+    if GARBAGE_PATTERNS.search(snippet):
+        return True
+    words = snippet.split()
+    if len(words) < MIN_SNIPPET_WORDS:
+        return True
+    ascii_words = sum(1 for w in words if re.match(r"^[A-Za-z'''-]+$", w))
+    if ascii_words / max(len(words), 1) < 0.5:
+        return True
+    return False
+
+
+def score_reference(line, song_title, artist, url, snippet):
+    """
+    Оценить один поисковый результат → dict или None (если мусор / нерелевант).
+
+    Ключевая идея: depth (уникальные слова) учитывается только
+    пропорционально lyric_overlap. Это убивает мусор вроде
+    TVTropes/random-blog, который набирает «глубину» без релевантности.
+    """
+    if _is_garbage_snippet(snippet):
+        return None
+
+    lyric_kws   = _keywords(line)
+    snippet_kws = _keywords(snippet) - NOISE_WORDS
+    meta_kws    = _keywords(f"{song_title} {artist}")
+
+    # Сколько слов из строки нашлось в сниппете
+    lyric_hits = len(lyric_kws & snippet_kws)
+    # Сколько слов из title/artist нашлось
+    meta_hits  = len(meta_kws & snippet_kws)
+
+    # Гейт: если ни одного слова из строки — нерелевантный результат
+    if lyric_hits < MIN_LYRIC_OVERLAP:
+        return None
+
+    # Depth: доля «новых» слов (не из запроса) — мера интерпретации
+    depth = len(snippet_kws - lyric_kws) / max(len(snippet_kws), 1)
+
+    # Gate: depth вносит полный вклад только при ≥2 совпадениях со строкой
+    depth_gate = min(lyric_hits / 2.0, 1.0)
+
+    confidence = round(min(1.0,
+        CONFIDENCE_BASE
+        + lyric_hits * LYRIC_WEIGHT
+        + meta_hits  * META_WEIGHT
+        + depth * DEPTH_WEIGHT * depth_gate
+    ), 2)
+
+    claim = snippet.lstrip(".-:; ").split(". ")[0][:120].strip() or "Lyric-related reference"
+    why   = "Interpretive context" if depth > 0.4 and lyric_hits >= 2 else "Confirms the quote"
+
     return {
-        "model": (cfg.get("openrouter_model") or "").strip(),
-        "judge_model": (cfg.get("openrouter_judge_model") or "").strip(),
-        "system_prompt": (cfg.get("system_prompt") or "").strip(),
-        "user_prompt": (cfg.get("user_prompt") or "").strip(),
-        "enable_web_search": as_bool(cfg.get("enable_web_search"), True),
+        "claim": claim,
+        "url": url,
+        "snippet": snippet[:300],
+        "why_it_supports": why,
+        "confidence": confidence,
     }
 
-CFG = load_llm_config()
-API_KEY    = os.getenv("OPENROUTER_API_KEY")
-SEARCH_KEY = os.getenv("SEARCH_API_KEY")
-MODEL      = CFG["model"]
-SYS_PROMPT = CFG["system_prompt"]
-USR_PROMPT = CFG["user_prompt"]
-ENABLE_WEB_SEARCH = CFG["enable_web_search"]
 
-HARD_BLOCKED_HOSTS = ("genius.com", "youtube.com", "youtu.be", "facebook.com", "instagram.com", "tiktok.com")
-LOW_TRUST_HOSTS = ("azlyrics.com", "lyrics.com", "musixmatch.com", "yarn.co")
-BLOCKED_URL_PARTS = ("/smash/get/", "arxiv.org", "researchgate.net")
-WEB_NOISE = {"search", "video", "clips", "click", "watch", "share", "download", "online",
-             "best", "free", "site", "page", "find", "view", "play", "quote", "about"}
+# ── Search ──────────────────────────────────────────────────────────
 
-# --- http ---
-def post(url, body, headers={}):
-    req = urllib.request.Request(url, json.dumps(body).encode(), {**headers, "Content-Type": "application/json"}, method="POST")
+def _tavily_search(query):
+    return _post("https://api.tavily.com/search", {
+        "api_key": SEARCH_KEY,
+        "query": query,
+        "max_results": MAX_RESULTS_PER_Q,
+    })
+
+
+def search(line, song_title="", artist=""):
+    """
+    Поиск интерпретаций через Tavily: strict → loose.
+    Возвращает (references, note).
+    """
+
+    meta = f"{song_title} {artist} meaning explained interpretation".strip()
+    # Ищем отсылки/значения, а не текст песни
+    queries = [
+        f'"{line}" {meta}',
+        f"{line} {meta}",
+        f"{line} reference allusion slang meaning",
+    ]
+
+    seen, results, errors = set(), [], []
+
+    for q in queries:
+        data = _tavily_search(q)
+        if data.get("_error"):
+            errors.append(data["_error"])
+            continue
+        for r in data.get("results", [])[:MAX_RESULTS_PER_Q]:
+            url     = r.get("url", "")
+            snippet = (r.get("content") or "").strip()
+            if not url or not snippet or url in seen:
+                continue
+            seen.add(url)
+            if _is_blocked(url):
+                continue
+            scored = score_reference(line, song_title, artist, url, snippet)
+            if scored is None:
+                continue
+            results.append(scored)
+
+    results.sort(key=lambda r: -r["confidence"])
+
+    strong = [r for r in results if r["confidence"] >= STRONG_CONFIDENCE]
+    if strong:
+        return strong[:MAX_STRONG_REFS], None
+    # Слабые refs не возвращаем — грейдер бракует любой ref < 0.60
+    if errors:
+        return [], f"Web search request failed: {errors[0]}."
+    if results:
+        return [], "Search returned only low-confidence sources."
+    return [], "Web search returned no usable sources."
+
+
+# ── HTTP ────────────────────────────────────────────────────────────
+
+def _post(url, body, headers=None):
+    h = {**(headers or {}), "Content-Type": "application/json"}
+    data = json.dumps(body, ensure_ascii=True).encode("ascii")
+    req = urllib.request.Request(url, data, h, method="POST")
     try:
-        return json.loads(urllib.request.urlopen(req, timeout=25).read())
+        resp = urllib.request.urlopen(req, timeout=25)
+        return json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        try: return {"_error": f"http_{e.code}", "body": e.read().decode("utf-8", "ignore")}
-        except: return {"_error": f"http_{e.code}"}
+        err_body = ""
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            pass
+        sys.stderr.write(f"[DEBUG] HTTP {e.code}: {err_body}\n")
+        return {"_error": f"http_{e.code}"}
     except Exception as e:
+        sys.stderr.write(f"[DEBUG] _post exception: {type(e).__name__}: {e}\n")
         return {"_error": str(e)}
 
-# --- input ---
+
+# ── LLM ─────────────────────────────────────────────────────────────
+
+def _extract_text(response):
+    """Текст из OpenRouter response (content → reasoning fallback)."""
+    try:
+        msg = (response.get("choices") or [{}])[0].get("message") or {}
+        text = msg.get("content")
+        if isinstance(text, list):
+            text = " ".join(
+                (c.get("text", "") if isinstance(c, dict) else str(c)) for c in text
+            )
+        text = (text or "").strip()
+        if not text:
+            text = (msg.get("reasoning") or "").strip()
+        return text[:500] if text else None
+    except Exception:
+        return None
+
+
+def _render_prompt(template, **variables):
+    for key, value in variables.items():
+        template = template.replace("{" + key + "}", value or "")
+    return template
+
+
+def get_meaning(line, song_text, song_title, artist, model, refs):
+    """Запросить у LLM интерпретацию строки. Возвращает str или None."""
+    evidence = "\n".join(f"- {r['url']}: {r['snippet']}" for r in refs) or "None"
+    context  = context_window(song_text, line)
+
+    prompt = _render_prompt(
+        USR_PROMPT,
+        line=line, target_line=line,
+        song_text=song_text[:1800], context_window=context,
+        song_title=song_title, artist=artist, evidence=evidence,
+    )
+
+    response = _post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": SYS_PROMPT},
+                {"role": "user",   "content": prompt},
+            ],
+            "temperature": 1.0,
+            "max_tokens": 256,
+        },
+        headers={"Authorization": f"Bearer {API_KEY}"},
+    )
+    text = _extract_text(response)
+    if text is None:
+        sys.stderr.write(f"[DEBUG] LLM returned no text. Response: {json.dumps(response, ensure_ascii=False)[:500]}\n")
+    return text
+
+
+# ── Helpers ─────────────────────────────────────────────────────────
+
+def context_window(song_text, line, radius=2):
+    """±radius строк вокруг target_line."""
+    if not song_text or not line:
+        return ""
+    rows = [x.strip() for x in song_text.splitlines() if x.strip()]
+    idx = next((i for i, r in enumerate(rows) if line.lower() in r.lower()), -1)
+    if idx < 0:
+        return "\n".join(rows[:6])[:700]
+    lo = max(0, idx - radius)
+    hi = min(len(rows), idx + radius + 1)
+    return "\n".join(rows[lo:hi])[:900]
+
+
+def build_uncertainties(refs, web_enabled, search_note):
+    if not web_enabled:
+        return ["Web search disabled; interpretation is based on lyric text alone."]
+    if search_note:
+        return [search_note]
+    if not refs:
+        return ["No supporting evidence found; interpretation is based on lyric text alone."]
+    if all(r["confidence"] < STRONG_CONFIDENCE for r in refs):
+        return ["Low-confidence sources"]
+    return []
+
+
+# ── Input ───────────────────────────────────────────────────────────
+
 def parse_input():
     raw = sys.argv[1] if len(sys.argv) > 1 else ""
     if not raw and not sys.stdin.isatty():
         raw = sys.stdin.read()
     data = json.loads(raw.strip()) if raw.strip() else {}
-    line = (data.get("target_line") or data.get("line") or "").strip()
-    song_text = (data.get("song_text") or "").strip()
-    song_title = (data.get("song_title") or "").strip()
-    artist = (data.get("artist") or "").strip()
-    model = (data.get("model") or MODEL or "").strip()
-    if model.startswith("{{") and model.endswith("}}"): model = MODEL or ""
-    model = model.removeprefix("openrouter:")
-    return {"line": line, "song_text": song_text, "song_title": song_title, "artist": artist, "model": model}
 
-# --- search ---
-def kws(s):
-    return {w.strip(".,:;!?()[]{}\"'").lower() for w in s.split() if len(w) > 3}
+    def field(*keys):
+        return next((data.get(k, "").strip() for k in keys if data.get(k)), "")
 
-def host(url):
-    try: return urllib.parse.urlparse(url).netloc.lower()
-    except: return ""
+    model = field("model") or MODEL
+    if model.startswith("{{"):
+        model = MODEL
 
-def context_window(song_text, line, radius=2):
-    if not song_text or not line: return ""
-    rows = [x.strip() for x in song_text.splitlines() if x.strip()]
-    idx = next((i for i, r in enumerate(rows) if line.lower() in r.lower()), -1)
-    if idx < 0: return "\n".join(rows[:6])[:700]
-    lo, hi = max(0, idx - radius), min(len(rows), idx + radius + 1)
-    return "\n".join(rows[lo:hi])[:900]
+    return {
+        "line":       field("target_line", "line"),
+        "song_text":  field("song_text"),
+        "song_title": field("song_title"),
+        "artist":     field("artist"),
+        "model":      model,
+    }
 
-def build_query(line, song_title="", artist="", strict=True):
-    meta = " ".join(x for x in [song_title, artist, "lyrics meaning explained"] if x).strip()
-    if strict:
-        return f"\"{line}\" {meta}".strip()
-    return f"{line} {meta}".strip()
 
-def _score_result(line, song_title, artist, url, snippet):
-    q = kws(line)
-    meta_q = kws(" ".join([song_title, artist]))
-    s_kws = kws(snippet) - WEB_NOISE
-    overlap = len(q & s_kws)
-    meta_overlap = len(meta_q & s_kws) if meta_q else 0
-    if q and overlap == 0 and meta_overlap == 0:
-        return None
-    extra = len(s_kws - q)
-    depth = round(extra / max(len(s_kws), 1), 2)
-    prose = len(re.findall(r"[.!?]\s+[A-Z]", snippet))
-    if prose < 2:
-        depth *= 0.5
-    conf = round(min(1, 0.2 + overlap * 0.1 + meta_overlap * 0.06 + depth * 0.45), 2)
-    if any(h in host(url) for h in LOW_TRUST_HOSTS):
-        conf = round(conf * 0.75, 2)
-    why = "Provides interpretive context" if depth > 0.5 else \
-          "Partial context beyond the lyric" if depth > 0.25 else \
-          "Mostly confirms the quote"
-    claim = snippet.lstrip(".-:; ").split(". ")[0][:120].strip() or "Lyric-related reference"
-    return {"claim": claim, "url": url, "snippet": snippet[:300], "why_it_supports": why, "confidence": conf}
+# ── Main ────────────────────────────────────────────────────────────
 
-def _run_search_query(query, max_results=8):
-    return post("https://api.tavily.com/search", {"api_key": SEARCH_KEY, "query": query, "max_results": max_results})
+if __name__ == "__main__":
+    inp = parse_input()
 
-def is_blocked_url(url):
-    u = (url or "").lower()
-    if not u:
-        return True
-    if u.startswith("ftp://"):
-        return True
-    if u.endswith(".pdf"):
-        return True
-    return any(part in u for part in BLOCKED_URL_PARTS)
+    if WEB_SEARCH:
+        refs, note = search(inp["line"], inp["song_title"], inp["artist"])
+    else:
+        refs, note = [], None
 
-def search(line, song_title="", artist=""):
-    if not SEARCH_KEY:
-        return []
-    queries = [
-        build_query(line, song_title, artist, strict=True),
-        build_query(line, song_title, artist, strict=False),
-    ]
-    seen_urls, out = set(), []
-    for qv in queries:
-        data = _run_search_query(qv, max_results=8)
-        if data.get("_error"):
-            continue
-        for r in data.get("results", [])[:8]:
-            url, sn = r.get("url"), (r.get("content") or "").strip()
-            if not url or not sn:
-                continue
-            if url in seen_urls:
-                continue
-            seen_urls.add(url)
-            if is_blocked_url(url):
-                continue
-            if any(b in host(url) for b in HARD_BLOCKED_HOSTS):
-                continue
-            scored = _score_result(line, song_title, artist, url, sn)
-            if not scored:
-                continue
-            out.append(scored)
-            if len(out) >= 8:
-                break
-        if len(out) >= 8:
-            break
-    out = sorted(out, key=lambda r: -r["confidence"])
-    strong = [r for r in out if r["confidence"] >= 0.55]
-    if strong:
-        return strong[:3]
-    return out[:2]
+    output = {
+        "meaning":       get_meaning(inp["line"], inp["song_text"], inp["song_title"],
+                                     inp["artist"], inp["model"], refs),
+        "references":    refs,
+        "uncertainties": build_uncertainties(refs, WEB_SEARCH, note),
+    }
 
-def assess_uncertainties(refs, web_search_enabled=True):
-    if not web_search_enabled:
-        return ["Web search disabled; interpretation is based on lyric text alone."]
-    if not refs:
-        return ["No supporting evidence found; interpretation is based on lyric text alone."]
-    u = []
-    avg = sum(r["confidence"] for r in refs) / len(refs)
-    if avg < 0.5:
-        u.append("Evidence is shallow — sources confirm the quote but add little interpretive context.")
-    if all(r["confidence"] < 0.6 for r in refs):
-        u.append("No high-confidence sources; interpretation may be speculative.")
-    return u
-
-# --- llm ---
-def _normalize_content(val):
-    """Строку вернуть как есть, массив частей — склеить."""
-    if isinstance(val, list):
-        return " ".join((x.get("text") or "") if isinstance(x, dict) else str(x) for x in val).strip()
-    return (val or "").strip()
-
-def extract_text(data):
-    """Достать текст из ответа OpenRouter (content → reasoning → reasoning_details)."""
-    try:
-        c = (data.get("choices") or [{}])[0]
-        m = c.get("message") or {}
-        # 1) content — основной ответ
-        txt = _normalize_content(m.get("content"))
-        # 2) fallback: reasoning-поля (для reasoning-моделей без content)
-        if not txt:
-            txt = (m.get("reasoning") or c.get("reasoning") or "").strip()
-        if not txt and isinstance(m.get("reasoning_details"), list) and m["reasoning_details"]:
-            txt = (m["reasoning_details"][0].get("text") or "").strip()
-        if not txt: return None
-        # 3) если content подозрительно длинный — возможно, модель вклеила CoT
-        paras = [p.strip() for p in txt.split("\n\n") if p.strip()]
-        if len(paras) > 1 and len(paras[-1]) > 20:
-            txt = paras[-1]
-        return txt[:500]
-    except: return None
-
-def fill_prompt(tpl, **kv):
-    for k, v in kv.items(): tpl = tpl.replace("{" + k + "}", v or "")
-    return tpl
-
-def local_meaning_fallback(line, song_text):
-    basis = (line or "").strip().strip("\"'")
-    ctx = context_window(song_text, line)
-    if basis:
-        return f'The lyric likely conveys emotional tension around "{basis}", suggesting conflict, pressure, or uncertainty in the song context.'
-    if ctx:
-        return "The excerpt suggests emotional tension and unresolved conflict, with the speaker reacting to pressure and uncertainty."
-    return "The lyric suggests emotional tension and uncertainty, with the speaker expressing a conflicted and vulnerable state."
-
-def meaning(line, song_text, song_title, artist, model, refs):
-    evidence = "\n".join(f"- {r['url']}: {r['snippet']}" for r in refs) or "None"
-    ctx = context_window(song_text, line)
-    data = post("https://openrouter.ai/api/v1/chat/completions", {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYS_PROMPT},
-            {"role": "user",   "content": fill_prompt(
-                USR_PROMPT,
-                line=line, target_line=line, song_text=song_text[:1800], context_window=ctx,
-                song_title=song_title, artist=artist, evidence=evidence
-            )},
-        ],
-        "temperature": 0.7, "max_tokens": 512,
-    }, {"Authorization": f"Bearer {API_KEY}"})
-    txt = extract_text(data)
-    if txt:
-        return txt
-    return local_meaning_fallback(line, song_text)
-
-# --- main ---
-inp = parse_input()
-refs = search(inp["line"], inp["song_title"], inp["artist"]) if ENABLE_WEB_SEARCH else []
-out = {"meaning": meaning(inp["line"], inp["song_text"], inp["song_title"], inp["artist"], inp["model"], refs), "references": refs, "uncertainties": assess_uncertainties(refs, web_search_enabled=ENABLE_WEB_SEARCH)}
-print(json.dumps(out, ensure_ascii=False))
+    print(json.dumps(output, ensure_ascii=False))
