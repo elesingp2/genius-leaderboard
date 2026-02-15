@@ -1,40 +1,86 @@
 # genius-leaderboard
 
-# ТЗ: MVP проекта "Genius-bench"
+Пошаговый setup MVP `Genius-bench`: как с нуля поднять локальный бенчмарк для сравнения LLM по объяснению строк песен и поиску отсылок с доказательствами.
 
-## 1. Цель
+## Что делает проект
 
-Создать простой бенчмарк для сравнения LLM по задаче:
+Для каждой строки песни агент должен:
 
-- Объяснение смысла строки/фрагмента песни  
-- Поиск отсылок **ТОЛЬКО** с доказательствами (URL + snippet)
+- объяснить смысл строки;
+- найти возможные отсылки и дать доказательства (`url` + `snippet`).
 
-Оценка производится одной метрикой: `GeniusScore`.
+Оценка одной метрикой: `GeniusScore` в диапазоне `0..1`.
 
-Масштабируемость не требуется. Приоритет — простота и минимальный стек.
+## 0) Предварительные требования
 
----
+Нужно установить:
 
-## 2. Входные данные
+- `Node.js` (рекомендуется 18+), чтобы запускать `promptfoo` через `npx`;
+- `Python` 3.10+ для `providers/agent.py`;
+- API-ключи:
+  - `OPENROUTER_API_KEY`
+  - `SEARCH_API_KEY` (например Tavily или другой search API).
 
-Файл `tests.jsonl`
+## 1) Подготовь структуру проекта
 
-Каждый тест содержит:
+В корне репозитория должны быть файлы:
 
-- `line` — строка песни (обязательное поле)
-- `model` — id модели OpenRouter (обязательное поле)
+- `promptfooconfig.yaml`
+- `tests.jsonl`
+- `providers/agent.py`
 
-Пример:
+Если их нет:
+
+```bash
+mkdir -p providers
+touch promptfooconfig.yaml tests.jsonl providers/agent.py
+```
+
+## 2) Настрой переменные окружения
+
+Создай `.env` в корне:
+
+```bash
+OPENROUTER_API_KEY=...
+SEARCH_API_KEY=...
+```
+
+Загрузи переменные в сессию:
+
+```bash
+set -a
+source .env
+set +a
+```
+
+`.env` уже в `.gitignore`, поэтому ключи не должны попасть в репозиторий.
+
+## 3) Подготовь тесты (`tests.jsonl`)
+
+Каждая строка в `tests.jsonl` — отдельный JSON-объект с `vars`.
+
+Минимальный пример для сравнения двух моделей:
 
 ```json
 {"vars":{"line":"Tonight it's Resident Evil and I feel like Leon","model":"openai/gpt-5-mini"}}
+{"vars":{"line":"Tonight it's Resident Evil and I feel like Leon","model":"anthropic/claude-3.5-sonnet"}}
 ```
 
----
+Обязательные поля:
 
-## 3. Формат ответа агента
+- `line` — строка песни;
+- `model` — ID модели OpenRouter.
 
-Агент обязан вернуть **СТРОГИЙ JSON**:
+## 4) Реализуй агент (`providers/agent.py`)
+
+`promptfoo` будет вызывать этот скрипт как `exec` provider. Агент должен:
+
+1. получить входные `vars` (как минимум `line` и `model`);
+2. сходить в search API и получить подтверждающие snippets;
+3. вызвать модель в OpenRouter;
+4. вернуть в `stdout` строго валидный JSON.
+
+Обязательный формат ответа агента:
 
 ```json
 {
@@ -52,75 +98,50 @@
 }
 ```
 
-### Требования:
-- JSON всегда валиден
-- Все `references` содержат `url` и `snippet`
-- Если доказательств нет → `references: []`
+Критично:
 
----
+- JSON всегда валиден;
+- каждый объект в `references` содержит `url` и `snippet`;
+- если доказательств нет, возвращай `references: []`.
 
-## 4. Архитектура
+## 5) Настрой `promptfooconfig.yaml`
 
-Минимальная схема:
-1. **promptfoo** запускает provider типа `exec`
-2. **agent.py** выполняет:
-   - Web search через API поиска
-   - Извлечение snippets
-   - Вызов модели через OpenRouter
-   - Возврат JSON в stdout
-3. **promptfoo** применяет одну метрику `llm-rubric` (GeniusScore)
+В конфиге должно быть:
 
----
+- provider типа `exec`, который вызывает `python providers/agent.py`;
+- подключение тестов из `tests.jsonl`;
+- один `assert` типа `llm-rubric` для расчета `GeniusScore`.
 
-## 5. Метрика: GeniusScore (0..1)
+Логика метрики:
 
-Оценивается через `llm-rubric`.
+- hard gate: если ответ невалидный JSON, или в reference нет `url`/`snippet` -> `score = 0`;
+- иначе: `score = 0.6 * meaning + 0.4 * references`.
 
-### Hard Gate (обязательное условие)
+## 6) Запусти оценку
 
-Если:
-- output невалидный JSON
-- **ИЛИ** хотя бы один reference не содержит `url` или `snippet`
+Из корня проекта:
 
-**→ score = 0**
+```bash
+npx promptfoo eval
+```
 
-### Если гейт пройден:
+(опционально) посмотреть результаты:
 
-`score = 0.6 * meaning + 0.4 * references`
+```bash
+npx promptfoo view
+```
 
-#### meaning:
-- точность
-- ясность
-- отсутствие воды
+## 7) Чек готовности MVP
 
-#### references:
-- claim конкретный
-- snippet выглядит как выдержка
-- `why_it_supports` логично связывает snippet и claim
-- нет утверждений вне evidence
+MVP готов, если:
 
----
+- `npx promptfoo eval` отрабатывает без падений;
+- сравниваются минимум 2 модели;
+- у каждой модели считается `GeniusScore`;
+- агент стабильно возвращает валидный JSON.
 
-## 6. Структура проекта
+## Типовые проблемы
 
-Обязательные файлы:
-- `promptfooconfig.yaml`
-- `tests.jsonl`
-- `providers/agent.py`
-
----
-
-## 7. Переменные окружения
-
-- `OPENROUTER_API_KEY`
-- `SEARCH_API_KEY`
-
----
-
-## 8. Критерии готовности
-
-Проект считается завершённым если:
-- `npx promptfoo eval` успешно запускается
-- Можно сравнить минимум 2 модели
-- Для каждой модели считается `GeniusScore`
-- Агент всегда возвращает валидный JSON
+- `score = 0` у всех ответов: чаще всего нарушен JSON-формат или пустые `url`/`snippet`.
+- `401/403` от API: проверь `OPENROUTER_API_KEY` и `SEARCH_API_KEY`.
+- `provider exec failed`: проверь путь к `providers/agent.py` и что скрипт печатает только JSON в `stdout`.

@@ -1,0 +1,22 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+description: Genius-bench MVP
+
+prompts:
+  - '{"line":"{{line}}","model":"{{model}}"}'
+
+providers:
+  - id: exec:python3 providers/agent.py
+
+tests: tests.jsonl
+
+defaultTest:
+  assert:
+    - type: is-json
+    - type: llm-rubric
+      provider: openrouter:stepfun/step-3.5-flash:free
+      metric: GeniusScore
+      value: >-
+        Score 0 if output is invalid JSON or any reference misses url/snippet;
+        otherwise score = 0.6*meaning + 0.4*references where meaning rewards
+        accuracy/clarity and references rewards specific claim + supporting
+        snippet + logical why_it_supports. Return a number from 0 to 1.
