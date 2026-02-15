@@ -1,7 +1,5 @@
 # genius-leaderboard
 
-I’ll answer as a world-famous LLM evaluation researcher (PhD) with the ACM SIGSOFT Distinguished Paper Award.
-
 # ТЗ: MVP проекта "Genius-bench"
 
 ## 1. Цель
